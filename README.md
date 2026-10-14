@@ -62,6 +62,8 @@ The GPUNetIO directory must contain `include/host/doca_gpunetio.h` and
 
 Developed by Hyungsun Yoo ([@shun-yoo](https://github.com/shun-yoo)).
 
+The upstream SPDK README follows.
+
 ---
 
 # Storage Performance Development Kit
