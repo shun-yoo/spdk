@@ -1,3 +1,69 @@
+# SPDK fork: GPU-initiated NVMe-oF I/O
+
+This is a fork of [SPDK](https://github.com/spdk/spdk). The `gpu-initiator` branch adds
+GPU-initiated I/O to the NVMe-oF initiator (RDMA transport): GPU threads send reads to the
+target and check their completions themselves, without the CPU. The CPU only sets up and
+tears down the connections. The GPU drives the NIC through DOCA GPUNetIO.
+
+The controller, the admin queue and the connection steps are upstream SPDK code. Queues that
+do not use this feature behave as in upstream.
+
+## Changes from the SPDK initiator
+
+Steps follow the SPDK RDMA initiator (`lib/nvme/nvme_rdma.c`). Work done on every read moves
+to the GPU, so the queues and buffers it touches are placed in GPU memory. One-time setup
+stays on the CPU.
+
+Connecting an I/O queue
+
+| SPDK step | Change | Implementation |
+|---|---|---|
+| Allocate the queue | None | |
+| Resolve the address and route | None | |
+| Create the QP and CQs (`nvme_rdma_qpair_init`) | Created in GPU memory | `nvme_rdma_gpu_qpair_create` |
+| Connection request (`nvme_rdma_connect`) | None | |
+| Finish the connection | None (existing path for an externally created QP) | `nvme_rdma_gpu_qpair_complete_connect` |
+| Register memory, prepare buffers (`nvme_rdma_connect_established`) | Buffers in GPU memory, registered once for all queues | `nvme_rdma_gpu_qpair_prepare` |
+| Fabrics Connect | Sent by the GPU, which also posts the receive buffers and checks the response | `nvme_rdma_gpu_qpair_fabric_connect` |
+
+One read
+
+| SPDK step | Change | Implementation |
+|---|---|---|
+| `spdk_nvme_ns_cmd_read` | Called by GPU code | `spdk_nvme_gpu_ns_cmd_read` |
+| Dispatch to the transport | Removed (RDMA only) | |
+| Build the command (`nvme_rdma_req_init`) | Each slot has a fixed command and data buffer, filled in when the queue is created (address, key, cid = slot). The GPU writes only the block address and count. | `nvme_rdma_gpu_qpair_prepare`, `spdk_nvme_gpu_ns_cmd_read` |
+| Post the send | By the GPU | `nvme_gpu_send` |
+| `spdk_nvme_qpair_process_completions` | Called by GPU code | `spdk_nvme_gpu_qpair_process_completions` |
+| Poll the CQ | By the GPU | `nvme_gpu_poll_recv_at` |
+| Find the request, repost the receive, check the send completion | By the GPU (cid is the slot) | `spdk_nvme_gpu_qpair_process_completions` |
+| Completion callback | Removed (completed slots are returned) | |
+
+If the GPU does not guarantee that NIC writes to its memory become visible in order
+(`CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING` below
+`CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER`), each completion check first flushes those writes
+with a loopback RDMA write (`nvme_gpu_flush`). This is decided when the queues are created.
+
+APIs: `include/spdk/nvme_gpu.h` (CPU) and `include/spdk/nvme_gpu.cuh` (GPU).
+
+## Build
+
+    ./configure --with-rdma --with-cuda --with-gpunetio=<GPUNetIO build directory>
+    make
+
+The GPUNetIO directory must contain `include/host/doca_gpunetio.h` and
+`lib/libdoca_gpunetio_host.so`. Requires a GPU of sm_80 or newer and an mlx5 (ConnectX) NIC.
+
+## Limitations
+
+- Reads only.
+- No timeout, abort or reconnect. GPU queues are not reconnected on a controller reset.
+- GPU queues are not added to poll groups.
+
+Developed by Hyungsun Yoo ([@shun-yoo](https://github.com/shun-yoo)).
+
+---
+
 # Storage Performance Development Kit
 
 [![Go Doc](https://img.shields.io/badge/godoc-reference-blue.svg)](http://godoc.org/github.com/spdk/spdk/go/rpc)
