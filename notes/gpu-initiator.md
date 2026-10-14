@@ -1,6 +1,6 @@
 # GPU 이니시에이터 설계
 
-`notes/initiator-flow.md`의 단계를 CPU 대신 GPU가 할 때 무엇이 바뀌는지 정리한다.
+`initiator-flow.md`의 단계를 CPU 대신 GPU가 할 때 무엇이 바뀌는지 정리한다.
 
 ## 원칙
 
