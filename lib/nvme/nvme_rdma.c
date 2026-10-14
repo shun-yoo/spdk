@@ -2,6 +2,7 @@
  *   Copyright (C) 2016 Intel Corporation. All rights reserved.
  *   Copyright (c) 2019-2021 Mellanox Technologies LTD. All rights reserved.
  *   Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *   Copyright (C) 2026 Hyungsun Yoo. All rights reserved.
  */
 
 /*
@@ -28,6 +29,9 @@
 #include "spdk_internal/rdma_provider.h"
 #include "spdk_internal/rdma_utils.h"
 #include "spdk_internal/sgl.h"
+#ifdef SPDK_CONFIG_GPUNETIO
+#include "nvme_rdma_gpu.h"
+#endif
 
 #define NVME_RDMA_TIME_OUT_IN_MS 2000
 #define NVME_RDMA_RW_BUFFER_SIZE 131072
@@ -262,6 +266,11 @@ struct nvme_rdma_qpair {
 	uint8_t					stale_conn_retry_count;
 	bool					need_destroy;
 	bool					connected;
+
+#ifdef SPDK_CONFIG_GPUNETIO
+	/* Set for a queue driven by the GPU (see nvme_rdma_gpu.h). */
+	struct nvme_rdma_gpu_qpair		*gpu;
+#endif
 	/* Guards against nvme_rdma_qpair_poll_accel() reentering itself for this
 	 * qpair, e.g. if an application's accel_fn_table.poll callback ends up
 	 * (directly or transitively) driving this same qpair's disconnect
@@ -369,6 +378,111 @@ nvme_rdma_qpair(struct spdk_nvme_qpair *qpair)
 	assert(qpair->trtype == SPDK_NVME_TRANSPORT_RDMA);
 	return SPDK_CONTAINEROF(qpair, struct nvme_rdma_qpair, qpair);
 }
+
+/*
+ * A GPU queue is connected through the same steps as a CPU queue. The helpers below are
+ * the steps where it differs: its queue pair is not created by the RDMA provider, and its
+ * buffers and Fabrics Connect are handled by nvme_rdma_gpu.cu.
+ */
+static inline bool
+nvme_rdma_qpair_is_gpu(struct nvme_rdma_qpair *rqpair)
+{
+#ifdef SPDK_CONFIG_GPUNETIO
+	return rqpair->gpu != NULL;
+#else
+	return false;
+#endif
+}
+
+static uint32_t
+nvme_rdma_qpair_qp_num(struct nvme_rdma_qpair *rqpair)
+{
+#ifdef SPDK_CONFIG_GPUNETIO
+	if (rqpair->gpu) {
+		return nvme_rdma_gpu_qpair_get_qp_num(rqpair->gpu);
+	}
+#endif
+	return rqpair->rdma_qp->qp->qp_num;
+}
+
+static int
+nvme_rdma_qpair_complete_connect(struct nvme_rdma_qpair *rqpair)
+{
+#ifdef SPDK_CONFIG_GPUNETIO
+	if (rqpair->gpu) {
+		return nvme_rdma_gpu_qpair_complete_connect(rqpair->gpu, rqpair->cm_id);
+	}
+#endif
+	return spdk_rdma_provider_qp_complete_connect(rqpair->rdma_qp);
+}
+
+static int
+nvme_rdma_qpair_disconnect_qp(struct nvme_rdma_qpair *rqpair)
+{
+#ifdef SPDK_CONFIG_GPUNETIO
+	if (rqpair->gpu) {
+		return spdk_rdma_cm_disconnect(rqpair->cm_id);
+	}
+#endif
+	return spdk_rdma_provider_qp_disconnect(rqpair->rdma_qp);
+}
+
+#ifdef SPDK_CONFIG_GPUNETIO
+/* Allocate a GPU queue's buffers and prepare its commands, including the Fabrics Connect. */
+static int
+nvme_rdma_qpair_gpu_prepare(struct nvme_rdma_qpair *rqpair)
+{
+	struct spdk_nvme_ctrlr *ctrlr = rqpair->qpair.ctrlr;
+	struct nvme_rdma_gpu_connect_info info = {};
+
+	/* The same values nvme_fabric_qpair_connect_async() puts in a Connect for this queue. */
+	info.qid = rqpair->qpair.id;
+	info.sqsize = rqpair->num_entries;
+	info.kato = ctrlr->opts.keep_alive_timeout_ms;
+	info.disable_sq_flow_control = ctrlr->opts.disable_sq_flow_control;
+	info.data.cntlid = ctrlr->cntlid;
+	memcpy(info.data.hostid, ctrlr->opts.extended_host_id, sizeof(info.data.hostid));
+	snprintf(info.data.hostnqn, sizeof(info.data.hostnqn), "%s", ctrlr->opts.hostnqn);
+	snprintf(info.data.subnqn, sizeof(info.data.subnqn), "%s", ctrlr->trid.subnqn);
+
+	return nvme_rdma_gpu_qpair_prepare(rqpair->gpu, &info);
+}
+
+/* The GPU sends the Fabrics Connect and waits for its response, so the queue is connected on success. */
+static int
+nvme_rdma_qpair_gpu_fabric_connect(struct nvme_rdma_qpair *rqpair)
+{
+	struct spdk_nvme_qpair *qpair = &rqpair->qpair;
+	int rc;
+
+	if (nvme_fabric_qpair_auth_required(qpair)) {
+		NVME_RQPAIR_ERRLOG(rqpair, "Authentication is not supported on GPU queues\n");
+		return -ENOTSUP;
+	}
+
+	rc = nvme_rdma_gpu_qpair_fabric_connect(rqpair->gpu);
+	if (rc == 0) {
+		rqpair->state = NVME_RDMA_QPAIR_STATE_RUNNING;
+		nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
+	}
+	return rc;
+}
+
+int
+nvme_rdma_qpair_set_gpu(struct spdk_nvme_qpair *qpair, struct nvme_rdma_gpu_qpair *gq,
+			uint32_t num_slots)
+{
+	struct nvme_rdma_qpair *rqpair = nvme_rdma_qpair(qpair);
+
+	if (rqpair->num_entries < num_slots) {
+		NVME_RQPAIR_ERRLOG(rqpair, "Queue holds %u commands, %u slots requested\n",
+				   rqpair->num_entries, num_slots);
+		return -EINVAL;
+	}
+	rqpair->gpu = gq;
+	return 0;
+}
+#endif
 
 static inline struct nvme_rdma_poll_group *
 nvme_rdma_poll_group(struct spdk_nvme_transport_poll_group *group)
@@ -501,7 +615,7 @@ nvme_rdma_qpair_process_cm_event(struct nvme_rdma_qpair *rqpair)
 		case RDMA_CM_EVENT_REJECTED:
 			break;
 		case RDMA_CM_EVENT_CONNECT_RESPONSE:
-			rc = spdk_rdma_provider_qp_complete_connect(rqpair->rdma_qp);
+			rc = nvme_rdma_qpair_complete_connect(rqpair);
 		/* fall through */
 		case RDMA_CM_EVENT_ESTABLISHED:
 			rqpair->connected = true;
@@ -518,7 +632,9 @@ nvme_rdma_qpair_process_cm_event(struct nvme_rdma_qpair *rqpair)
 			 * work requests in the send qp will be flushed, otherwise, the outstanding
 			 * wrs may not be completed forever.
 			 */
-			spdk_rdma_provider_qp_disconnect(rqpair->rdma_qp);
+			if (rqpair->rdma_qp != NULL) {
+				spdk_rdma_provider_qp_disconnect(rqpair->rdma_qp);
+			}
 			rqpair->connected = false;
 			rqpair->qpair.transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_REMOTE;
 			break;
@@ -826,6 +942,13 @@ nvme_rdma_qpair_init(struct nvme_rdma_qpair *rqpair)
 	struct ibv_device_attr	dev_attr;
 	struct nvme_rdma_ctrlr	*rctrlr;
 	uint32_t num_cqe, max_num_cqe;
+
+#ifdef SPDK_CONFIG_GPUNETIO
+	if (rqpair->gpu) {
+		rqpair->cm_id->context = rqpair;
+		return nvme_rdma_gpu_qpair_create(rqpair->gpu, rqpair->cm_id);
+	}
+#endif
 
 	rc = ibv_query_device(rqpair->cm_id->verbs, &dev_attr);
 	if (rc != 0) {
@@ -1276,6 +1399,16 @@ nvme_rdma_connect_established(struct nvme_rdma_qpair *rqpair, int ret)
 		return ret;
 	}
 
+#ifdef SPDK_CONFIG_GPUNETIO
+	if (rqpair->gpu) {
+		ret = nvme_rdma_qpair_gpu_prepare(rqpair);
+		if (ret == 0) {
+			rqpair->state = NVME_RDMA_QPAIR_STATE_FABRIC_CONNECT_SEND;
+		}
+		return ret;
+	}
+#endif
+
 	assert(!rqpair->mr_map);
 	rqpair->mr_map = spdk_rdma_utils_create_mem_map(rqpair->rdma_qp->qp->pd, &g_nvme_hooks,
 			 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
@@ -1353,7 +1486,7 @@ nvme_rdma_connect(struct nvme_rdma_qpair *rqpair)
 	/* Fields below are ignored by rdma cm if qpair has been
 	 * created using rdma cm API. */
 	param.srq = 0;
-	param.qp_num = rqpair->rdma_qp->qp->qp_num;
+	param.qp_num = nvme_rdma_qpair_qp_num(rqpair);
 
 	ret = spdk_rdma_cm_connect(rqpair->cm_id, &param);
 	if (ret) {
@@ -1519,6 +1652,12 @@ nvme_rdma_ctrlr_connect_qpair_poll(struct spdk_nvme_ctrlr *ctrlr,
 		}
 		break;
 	case NVME_RDMA_QPAIR_STATE_FABRIC_CONNECT_SEND:
+#ifdef SPDK_CONFIG_GPUNETIO
+		if (rqpair->gpu) {
+			rc = nvme_rdma_qpair_gpu_fabric_connect(rqpair);
+			break;
+		}
+#endif
 		rc = nvme_fabric_qpair_connect_async(qpair, rqpair->num_entries + 1);
 		if (rc == 0) {
 			rqpair->state = NVME_RDMA_QPAIR_STATE_FABRIC_CONNECT_POLL;
@@ -2496,6 +2635,12 @@ nvme_rdma_qpair_destroy(struct nvme_rdma_qpair *rqpair)
 		spdk_rdma_utils_put_pd(pd);
 	}
 
+#ifdef SPDK_CONFIG_GPUNETIO
+	if (rqpair->gpu) {
+		nvme_rdma_gpu_qpair_destroy(rqpair->gpu);
+	}
+#endif
+
 	/* destroy cm_id last so cma device will not be freed before we destroy the cq. */
 	if (rqpair->cm_id) {
 		spdk_rdma_cm_destroy_id(rqpair->cm_id);
@@ -2669,8 +2814,8 @@ _nvme_rdma_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvm
 	rqpair->state = NVME_RDMA_QPAIR_STATE_EXITING;
 
 	if (rqpair->cm_id) {
-		if (rqpair->rdma_qp && rqpair->connected) {
-			rc = spdk_rdma_provider_qp_disconnect(rqpair->rdma_qp);
+		if ((rqpair->rdma_qp || nvme_rdma_qpair_is_gpu(rqpair)) && rqpair->connected) {
+			rc = nvme_rdma_qpair_disconnect_qp(rqpair);
 			if ((qpair->ctrlr != NULL) && (rc == 0)) {
 				rc = nvme_rdma_process_event_start(rqpair, RDMA_CM_EVENT_DISCONNECTED,
 								   disconnected_qpair_cb);
@@ -2838,6 +2983,12 @@ nvme_rdma_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 	nvme_rdma_qpair_abort_reqs(qpair, qpair->abort_dnr);
 	assert(TAILQ_EMPTY(&rqpair->outstanding_reqs));
 	nvme_qpair_deinit(qpair);
+
+#ifdef SPDK_CONFIG_GPUNETIO
+	if (rqpair->gpu) {
+		nvme_rdma_gpu_qpair_free(rqpair->gpu);
+	}
+#endif
 
 	spdk_free(rqpair);
 
@@ -3046,6 +3197,11 @@ nvme_rdma_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 	rqpair = nvme_rdma_qpair(qpair);
 	assert(rqpair != NULL);
 	assert(req != NULL);
+
+	if (spdk_unlikely(nvme_rdma_qpair_is_gpu(rqpair))) {
+		/* GPU code submits this queue's commands (spdk/nvme_gpu.cuh). */
+		return -EINVAL;
+	}
 
 	rdma_req = nvme_rdma_req_get(rqpair);
 	if (spdk_unlikely(!rdma_req)) {
@@ -3476,6 +3632,11 @@ nvme_rdma_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 
 	if (spdk_unlikely(qpair->transport_failure_reason != SPDK_NVME_QPAIR_FAILURE_NONE)) {
 		goto failed;
+	}
+
+	if (nvme_rdma_qpair_is_gpu(rqpair)) {
+		/* GPU code reaps this queue's completions (spdk/nvme_gpu.cuh). */
+		return 0;
 	}
 
 	rqpair->num_completions = 0;

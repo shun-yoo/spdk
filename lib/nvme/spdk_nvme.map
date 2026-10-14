@@ -314,5 +314,11 @@
 	spdk_nvme_trid_entry_parse;
 	spdk_nvme_build_name;
 
+	# public functions from nvme_gpu.h
+	spdk_nvme_gpu_qpair_get_default_opts;
+	spdk_nvme_ctrlr_alloc_gpu_io_qpairs;
+	spdk_nvme_ctrlr_free_gpu_io_qpairs;
+	spdk_nvme_gpu_qpairs_get_device;
+
 	local: *;
 };

@@ -18,6 +18,8 @@ C_SRCS = nvme_ctrlr_cmd.c nvme_ctrlr.c nvme_fabric.c nvme_ns_cmd.c \
 C_SRCS-$(CONFIG_NVME_CUSE) += nvme_cuse.c
 C_SRCS-$(CONFIG_VFIO_USER) += nvme_vfio_user.c
 C_SRCS-$(CONFIG_RDMA) += nvme_rdma.c
+C_SRCS-$(CONFIG_GPUNETIO) += nvme_rdma_gpu.c
+CU_SRCS-$(CONFIG_GPUNETIO) += nvme_rdma_gpu.cu
 
 LIBNAME = nvme
 LOCAL_SYS_LIBS =
@@ -38,6 +40,15 @@ ifneq ("$(wildcard /usr/lib/libcxgb4.*)","")
 LOCAL_SYS_LIBS += -lcxgb4
 endif
 endif
+endif
+
+ifeq ($(CONFIG_GPUNETIO),y)
+# GPUNetIO's device code needs sm_80 or newer.
+CUDA_ARCH = 80
+CU_CFLAGS += -I$(CONFIG_GPUNETIO_DIR)/include -I$(CONFIG_GPUNETIO_DIR)/include/host \
+	-I$(CONFIG_GPUNETIO_DIR)/include/common -I$(CONFIG_GPUNETIO_DIR)/include/device
+LOCAL_SYS_LIBS += -L$(CONFIG_GPUNETIO_DIR)/lib -Wl,-rpath,$(CONFIG_GPUNETIO_DIR)/lib \
+	-ldoca_gpunetio_host -lmlx5 -lrdmacm
 endif
 
 ifeq ($(CONFIG_NVME_CUSE),y)
